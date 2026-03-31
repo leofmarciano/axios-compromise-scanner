@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 AFFECTED_PACKAGES = {
     "axios": ["0.30.4", "1.14.1"],
@@ -79,7 +79,7 @@ else:
     DEFAULT_SCAN_ROOTS = [HOME, "/tmp", "/var/tmp"]
 
 class Finding:
-    def __init__(self, msg: str, evidence: List[str] | None = None):
+    def __init__(self, msg: str, evidence: Optional[List[str]] = None):
         self.msg = msg
         self.evidence: List[str] = evidence or []
 
@@ -94,10 +94,10 @@ class Report:
         self.info: List[str] = []
         self.artifacts: Dict[str, str] = {}
 
-    def hit(self, msg: str, evidence: List[str] | None = None):
+    def hit(self, msg: str, evidence: Optional[List[str]] = None):
         self.hits.append(Finding(msg, evidence))
 
-    def warn(self, msg: str, evidence: List[str] | None = None):
+    def warn(self, msg: str, evidence: Optional[List[str]] = None):
         self.warnings.append(Finding(msg, evidence))
 
     def note(self, msg: str):
