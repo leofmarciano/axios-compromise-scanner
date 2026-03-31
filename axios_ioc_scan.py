@@ -34,6 +34,9 @@ IOC_STRINGS = [
     "ld.py",
 ]
 
+# Word-boundary regexes to avoid false positives (e.g. "ld.py" inside "build.py")
+IOC_PATTERNS = [re.compile(r'(?<![a-zA-Z0-9_/\\])' + re.escape(s) + r'(?![a-zA-Z0-9_])') for s in IOC_STRINGS]
+
 PATH_IOCS = {
     "darwin": [
         "/Library/Caches/com.apple.act.mond",
@@ -75,21 +78,47 @@ if platform.system().lower() == "windows":
 else:
     DEFAULT_SCAN_ROOTS = [HOME, "/tmp", "/var/tmp"]
 
+class Finding:
+    def __init__(self, msg: str, evidence: List[str] | None = None):
+        self.msg = msg
+        self.evidence: List[str] = evidence or []
+
+    def __str__(self):
+        return self.msg
+
+
 class Report:
     def __init__(self):
-        self.hits: List[str] = []
-        self.warnings: List[str] = []
+        self.hits: List[Finding] = []
+        self.warnings: List[Finding] = []
         self.info: List[str] = []
         self.artifacts: Dict[str, str] = {}
 
-    def hit(self, msg: str):
-        self.hits.append(msg)
+    def hit(self, msg: str, evidence: List[str] | None = None):
+        self.hits.append(Finding(msg, evidence))
 
-    def warn(self, msg: str):
-        self.warnings.append(msg)
+    def warn(self, msg: str, evidence: List[str] | None = None):
+        self.warnings.append(Finding(msg, evidence))
 
     def note(self, msg: str):
         self.info.append(msg)
+
+
+def find_ioc_matches(text: str, max_context: int = 120) -> List[Tuple[str, List[str]]]:
+    """Search text for IOC patterns with word boundaries. Returns list of (ioc_string, [evidence_lines])."""
+    results = []
+    lines = text.splitlines()
+    for ioc, pat in zip(IOC_STRINGS, IOC_PATTERNS):
+        evidence = []
+        for lineno, line in enumerate(lines, 1):
+            if pat.search(line):
+                snippet = line.strip()
+                if len(snippet) > max_context:
+                    snippet = snippet[:max_context] + "..."
+                evidence.append(f"  line {lineno}: {snippet}")
+        if evidence:
+            results.append((ioc, evidence[:10]))
+    return results
 
 
 def run_cmd(cmd: List[str], timeout: int = 20) -> Tuple[int, str, str]:
@@ -135,13 +164,17 @@ def find_ioc_files(report: Report, outdir: Path):
     for raw in PATH_IOCS.get(pk, []):
         p = expand_env_path(raw)
         if p.exists():
-            report.hit(f"Encontrado artefato de IOC no caminho conhecido: {p}")
+            sha = ""
             try:
-                report.note(f"SHA256 {p}: {sha256_file(p)}")
+                sha = sha256_file(p)
             except Exception:
                 pass
+            ev = [f"Path exists: {p}"]
+            if sha:
+                ev.append(f"SHA256: {sha}")
+            report.hit(f"IOC artifact found at known path: {p}", ev)
         else:
-            report.note(f"Caminho não encontrado: {p}")
+            report.note(f"Path not found: {p}")
 
 
 def process_scan(report: Report, outdir: Path):
@@ -151,21 +184,25 @@ def process_scan(report: Report, outdir: Path):
         commands = [["ps", "aux"]]
     else:
         commands = [["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | Format-List"]]
-    suspicious = []
+    evidence = []
     for cmd in commands:
         rc, out, err = run_cmd(cmd, timeout=30)
         (outdir / "processes.txt").write_text(out + ("\nSTDERR:\n" + err if err else ""), encoding="utf-8")
-        blob = (out + "\n" + err).lower()
-        for needle in ["sfrclak.com", "6202033", "com.apple.act.mond", "wt.exe", "ld.py", "plain-crypto-js"]:
-            if needle.lower() in blob:
-                suspicious.append(needle)
-    if suspicious:
-        report.hit("Processos com indicadores suspeitos: " + ", ".join(sorted(set(suspicious))))
+        blob = out + "\n" + err
+        matches = find_ioc_matches(blob)
+        for ioc, lines in matches:
+            evidence.append(f"[process list] IOC '{ioc}':")
+            evidence.extend(lines)
+    if evidence:
+        report.hit("Processes with suspicious indicators", evidence)
 
 
 def persistence_scan(report: Report, outdir: Path):
     pk = get_platform_key()
-    findings = []
+    evidence = []
+    persist_needles = [re.compile(r'(?<![a-zA-Z0-9_/\\])' + re.escape(s) + r'(?![a-zA-Z0-9_])') for s in
+                       ["sfrclak.com", "6202033", "com.apple.act.mond", "wt.exe", "ld.py", "powershell -w hidden", "ep bypass"]]
+    persist_names = ["sfrclak.com", "6202033", "com.apple.act.mond", "wt.exe", "ld.py", "powershell -w hidden", "ep bypass"]
     if pk == "darwin":
         scan_dirs = [Path(HOME) / "Library/LaunchAgents", Path("/Library/LaunchAgents"), Path("/Library/LaunchDaemons")]
         for d in scan_dirs:
@@ -173,25 +210,26 @@ def persistence_scan(report: Report, outdir: Path):
                 continue
             for file in d.rglob("*.plist"):
                 text = safe_read_text(file)
-                if any(s in text for s in ["sfrclak.com", "6202033", "com.apple.act.mond"]):
-                    findings.append(str(file))
+                for name, pat in zip(persist_names, persist_needles):
+                    if pat.search(text):
+                        evidence.append(f"[plist] {file} matches '{name}'")
         rc, out, err = run_cmd(["launchctl", "list"], timeout=20)
         (outdir / "launchctl.txt").write_text(out + ("\nSTDERR:\n" + err if err else ""), encoding="utf-8")
-        if any(x in out.lower() for x in ["mond", "6202033", "sfrclak"]):
-            findings.append("launchctl:list")
+        for name, pat in zip(persist_names, persist_needles):
+            if pat.search(out):
+                evidence.append(f"[launchctl list] matches '{name}'")
     elif pk == "windows":
         cmds = [
             ["powershell", "-NoProfile", "-Command", "Get-ScheduledTask | Select-Object TaskName,TaskPath,State | Format-List"],
             ["powershell", "-NoProfile", "-Command", "Get-ItemProperty HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run,HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run -ErrorAction SilentlyContinue | Format-List"],
         ]
-        merged = []
         for idx, cmd in enumerate(cmds):
             rc, out, err = run_cmd(cmd, timeout=30)
             (outdir / f"windows_persistence_{idx}.txt").write_text(out + ("\nSTDERR:\n" + err if err else ""), encoding="utf-8")
-            merged.append(out + err)
-        blob = "\n".join(merged).lower()
-        if any(x in blob for x in ["wt.exe", "6202033", "sfrclak", "powershell -w hidden", "ep bypass"]):
-            findings.append("windows:persistence")
+            blob = out + err
+            for name, pat in zip(persist_names, persist_needles):
+                if pat.search(blob):
+                    evidence.append(f"[windows persistence {idx}] matches '{name}'")
     else:
         dirs = [Path("/etc/systemd/system"), Path(HOME) / ".config/systemd/user", Path("/etc/cron.d"), Path("/var/spool/cron")]
         for d in dirs:
@@ -200,33 +238,38 @@ def persistence_scan(report: Report, outdir: Path):
             for file in d.rglob("*"):
                 if file.is_file():
                     text = safe_read_text(file)
-                    if any(x in text for x in ["ld.py", "6202033", "sfrclak.com"]):
-                        findings.append(str(file))
-    if findings:
-        report.hit("Possível persistência encontrada em: " + ", ".join(findings[:20]))
+                    for name, pat in zip(persist_names, persist_needles):
+                        if pat.search(text):
+                            evidence.append(f"[systemd/cron] {file} matches '{name}'")
+    if evidence:
+        report.hit("Possible persistence mechanism detected", evidence)
 
 
 def network_scan(report: Report, outdir: Path):
-    findings = []
+    evidence = []
     tools = []
     if shutil.which("lsof"):
         tools.append(["lsof", "-nPi"])
     elif shutil.which("netstat"):
         tools.append(["netstat", "-an"])
+    net_needles = [re.compile(r'(?<![a-zA-Z0-9_/\\])' + re.escape(s) + r'(?![a-zA-Z0-9_])') for s in ["142.11.206.73", "sfrclak.com"]]
+    net_names = ["142.11.206.73", "sfrclak.com"]
     for idx, cmd in enumerate(tools):
         rc, out, err = run_cmd(cmd, timeout=20)
         (outdir / f"network_{idx}.txt").write_text(out + ("\nSTDERR:\n" + err if err else ""), encoding="utf-8")
-        blob = (out + err).lower()
-        for x in ["142.11.206.73", "sfrclak.com", ":8000"]:
-            if x.lower() in blob:
-                findings.append(x)
+        blob = out + err
+        for name, pat in zip(net_names, net_needles):
+            for line in blob.splitlines():
+                if pat.search(line):
+                    snippet = line.strip()[:120]
+                    evidence.append(f"[{' '.join(cmd[:2])}] '{name}': {snippet}")
     try:
         ip = socket.gethostbyname("sfrclak.com")
-        report.note(f"Resolução atual de sfrclak.com: {ip}")
+        report.note(f"Current resolution of sfrclak.com: {ip}")
     except Exception as e:
-        report.note(f"Não foi possível resolver sfrclak.com: {e}")
-    if findings:
-        report.hit("Indícios de rede ao C2 ou porta associada: " + ", ".join(sorted(set(findings))))
+        report.note(f"Could not resolve sfrclak.com: {e}")
+    if evidence:
+        report.hit("Network indicators of C2 connection", evidence)
 
 
 def version_regexes() -> List[re.Pattern]:
@@ -241,8 +284,10 @@ def version_regexes() -> List[re.Pattern]:
 
 def scan_project_files(report: Report, outdir: Path, roots: List[Path]):
     regs = version_regexes()
-    findings = []
+    version_findings = []
+    version_evidence = []
     ioc_findings = []
+    ioc_evidence = []
     searched = 0
     for root in roots:
         if not root.exists():
@@ -258,22 +303,26 @@ def scan_project_files(report: Report, outdir: Path, roots: List[Path]):
                 if not text:
                     continue
                 for rg in regs:
-                    if rg.search(text):
-                        findings.append(str(path))
+                    m = rg.search(text)
+                    if m:
+                        version_findings.append(str(path))
+                        version_evidence.append(f"[{path}] matched: {m.group(0)}")
                         break
-                for ioc in IOC_STRINGS:
-                    if ioc in text or ioc in path_str:
-                        ioc_findings.append(f"{path}: {ioc}")
+                matches = find_ioc_matches(text)
+                for ioc, lines in matches:
+                    ioc_findings.append(f"{path}: {ioc}")
+                    ioc_evidence.append(f"[{path}] IOC '{ioc}':")
+                    ioc_evidence.extend(lines)
     (outdir / "project_findings.json").write_text(json.dumps({
-        "version_hits": findings[:500],
+        "version_hits": version_findings[:500],
         "ioc_hits": ioc_findings[:500],
         "files_checked": searched,
     }, indent=2), encoding="utf-8")
-    if findings:
-        report.hit(f"Encontrados arquivos de projeto/lockfile com versões afetadas: {len(findings)} ocorrência(s)")
+    if version_findings:
+        report.hit(f"Found project/lockfile files with affected versions: {len(version_findings)} occurrence(s)", version_evidence[:50])
     if ioc_findings:
-        report.hit(f"Encontrados indicadores textuais em arquivos de projeto: {len(ioc_findings)} ocorrência(s)")
-    report.note(f"Arquivos verificados na varredura de projetos: {searched}")
+        report.hit(f"Found textual indicators in project files: {len(ioc_findings)} occurrence(s)", ioc_evidence[:50])
+    report.note(f"Files checked in project scan: {searched}")
 
 
 def npm_logs_scan(report: Report, outdir: Path):
@@ -289,23 +338,33 @@ def npm_logs_scan(report: Report, outdir: Path):
         appdata = os.environ.get("APPDATA")
         if appdata:
             candidates.append(Path(appdata) / "npm-cache/_logs")
+    npm_needles = ["plain-crypto-js", "axios@1.14.1", "axios@0.30.4", "sfrclak.com"]
+    npm_pats = [re.compile(r'(?<![a-zA-Z0-9_/\\])' + re.escape(s) + r'(?![a-zA-Z0-9_])') for s in npm_needles]
     hits = []
+    evidence = []
+
+    def _check_file(fpath: Path, limit: int = 1024 * 512):
+        text = safe_read_text(fpath, limit=limit)
+        for name, pat in zip(npm_needles, npm_pats):
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if pat.search(line):
+                    hits.append(str(fpath))
+                    snippet = line.strip()[:120]
+                    evidence.append(f"[{fpath}] line {lineno}: '{name}' -> {snippet}")
+                    return
+
     for c in candidates:
         if not c.exists():
             continue
         if c.is_file():
-            text = safe_read_text(c)
-            if any(x in text for x in ["plain-crypto-js", "axios@1.14.1", "axios@0.30.4", "sfrclak.com"]):
-                hits.append(str(c))
+            _check_file(c)
         else:
             for f in c.rglob("*"):
                 if f.is_file():
-                    text = safe_read_text(f, limit=1024 * 256)
-                    if any(x in text for x in ["plain-crypto-js", "axios@1.14.1", "axios@0.30.4", "sfrclak.com"]):
-                        hits.append(str(f))
+                    _check_file(f, limit=1024 * 256)
     (outdir / "npm_log_hits.txt").write_text("\n".join(hits), encoding="utf-8")
     if hits:
-        report.warn(f"Encontrados vestígios em histórico/logs npm ou shell: {len(hits)}")
+        report.warn(f"Found traces in npm logs or shell history: {len(hits)}", evidence[:20])
 
 
 def temp_artifacts_scan(report: Report, outdir: Path):
@@ -319,6 +378,7 @@ def temp_artifacts_scan(report: Report, outdir: Path):
     else:
         roots.extend([Path("/tmp"), Path("/var/tmp"), Path(tempfile.gettempdir())])
     found = []
+    evidence = []
     for r in roots:
         if not r.exists():
             continue
@@ -326,9 +386,14 @@ def temp_artifacts_scan(report: Report, outdir: Path):
             p = r / name
             if p.exists():
                 found.append(str(p))
+                try:
+                    sha = sha256_file(p)
+                    evidence.append(f"[{p}] SHA256: {sha}")
+                except Exception:
+                    evidence.append(f"[{p}] file exists")
     (outdir / "temp_artifacts.txt").write_text("\n".join(found), encoding="utf-8")
     if found:
-        report.hit("Artefatos temporários suspeitos encontrados: " + ", ".join(found))
+        report.hit("Suspicious temporary artifacts found: " + ", ".join(found), evidence)
 
 
 def summarize(report: Report) -> str:
@@ -363,8 +428,8 @@ def main():
     verdict = summarize(report)
     result = {
         "verdict": verdict,
-        "hits": report.hits,
-        "warnings": report.warnings,
+        "hits": [{"finding": f.msg, "evidence": f.evidence} for f in report.hits],
+        "warnings": [{"finding": f.msg, "evidence": f.evidence} for f in report.warnings],
         "info": report.info,
         "generated_at_utc": dt.datetime.now(dt.UTC).isoformat() + "Z",
         "scan_roots": [str(x) for x in roots],
@@ -375,18 +440,31 @@ def main():
     json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
 
     lines = []
-    lines.append(f"Verdict: {verdict}")
+    sep = "-" * 60
+    lines.append(sep)
+    lines.append(f"  VERDICT: {verdict}")
+    lines.append(sep)
     lines.append("")
     if report.hits:
-        lines.append("Strong indicators:")
-        lines.extend([f"- {x}" for x in report.hits])
+        lines.append(f"STRONG INDICATORS ({len(report.hits)}):")
         lines.append("")
+        for i, f in enumerate(report.hits, 1):
+            lines.append(f"  [{i}] {f.msg}")
+            if f.evidence:
+                for ev in f.evidence:
+                    lines.append(f"      {ev}")
+            lines.append("")
     if report.warnings:
-        lines.append("Warnings:")
-        lines.extend([f"- {x}" for x in report.warnings])
+        lines.append(f"WARNINGS ({len(report.warnings)}):")
         lines.append("")
-    lines.append("Info:")
-    lines.extend([f"- {x}" for x in report.info])
+        for i, f in enumerate(report.warnings, 1):
+            lines.append(f"  [{i}] {f.msg}")
+            if f.evidence:
+                for ev in f.evidence:
+                    lines.append(f"      {ev}")
+            lines.append("")
+    lines.append("INFO:")
+    lines.extend([f"  - {x}" for x in report.info])
     lines.append("")
     if verdict == "POSSIBLE_COMPROMISE":
         lines.append("Recommended next steps:")
